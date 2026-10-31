@@ -154,6 +154,37 @@ pub const posix = struct {
 
     // --- lifted from zig 0.15.2 std.posix (libc-backed, linux only) ---
 
+    pub const GetCwdError = error{
+        NameTooLong,
+        AccessDenied,
+        Unexpected,
+    };
+
+    pub fn getcwd(buf: []u8) GetCwdError![]u8 {
+        if (builtin.os.tag == .linux) {
+            const rc = std.os.linux.getcwd(buf.ptr, buf.len);
+            const signed_rc: isize = @bitCast(rc);
+            if (signed_rc >= 0) {
+                return buf[0..@intCast(signed_rc)];
+            }
+            switch (std.os.linux.E.init(rc)) {
+                .RANGE => return error.NameTooLong,
+                .ACCES => return error.AccessDenied,
+                else => |err| return unexpectedErrno(err),
+            }
+        } else {
+            const rc = system.getcwd(buf.ptr, buf.len);
+            if (rc != null) {
+                return mem.sliceTo(buf, 0);
+            }
+            switch (errno(-1)) {
+                .RANGE => return error.NameTooLong,
+                .ACCES => return error.AccessDenied,
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+    }
+
     pub fn getenv(key: []const u8) ?[:0]const u8 {
         if (mem.indexOfScalar(u8, key, '=') != null) return null;
         var ptr = std.c.environ;
