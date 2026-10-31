@@ -149,10 +149,6 @@ pub const posix = struct {
     pub const errno = std.posix.errno;
     pub const unexpectedErrno = std.posix.unexpectedErrno;
     pub const E = std.posix.E;
-    /// 0.16 made std.posix.Stat void on linux; Statx keeps the same field
-    /// names for the common members (size, mode, uid, gid, ino, nlink).
-    // statx is Linux-only. Everywhere else this is the libc stat struct;
-    // both expose `.size`, which is all callers use.
     pub const Stat = if (builtin.os.tag == .linux) std.os.linux.Statx else std.c.Stat;
     pub const ReadError = std.posix.ReadError;
 
@@ -180,17 +176,24 @@ pub const posix = struct {
 
     pub fn close(fd: fd_t) void {
         switch (errno(system.close(fd))) {
-            .BADF => unreachable, // always a race condition
-            .INTR => return, // still a success, see ziglang/zig#2425
+            .BADF => unreachable,
+            .INTR => return,
             else => return,
         }
     }
 
     /// Reposition the file offset. `whence` is SEEK_SET(0)/CUR(1)/END(2).
-    /// Returns the resulting offset. Used to rewind a capture temp file after
-    /// a command has written to it, before reading it back.
+    /// Returns the resulting offset.
     pub fn lseek(fd: fd_t, offset: i64, whence: u32) !i64 {
         if (builtin.os.tag == .linux) {
+            // On 32-bit Android, std.os.linux.lseek causes a @bitCast size mismatch
+            // (i64 -> usize). Bionic provides lseek64 for exactly this purpose.
+            if (builtin.target.abi.isAndroid() and builtin.target.ptrBitWidth() == 32) {
+                const lseek64 = @extern(*const fn (fd_t, i64, c_int) callconv(.C) i64, .{ .name = "lseek64" });
+                const rc = lseek64(fd, offset, @intCast(whence));
+                if (rc < 0) return error.SeekFailed;
+                return rc;
+            }
             const rc = std.os.linux.lseek(fd, offset, whence);
             if (@as(isize, @bitCast(rc)) < 0) return error.SeekFailed;
             return @intCast(rc);
@@ -207,11 +210,6 @@ pub const posix = struct {
                 .SUCCESS => return,
                 .BUSY, .INTR => continue,
                 .MFILE => return error.ProcessFdQuotaExceeded,
-                // A user redirect supplies these fds — `echo hi >&9` dup2s a fd
-                // that was never opened (EBADF), and `n>&m` can pass a bad/large
-                // fd (EINVAL). These are user error, NOT a shell bug: return an
-                // error so the redirect fails cleanly instead of aborting the
-                // whole shell on `unreachable`.
                 .INVAL, .BADF => return error.BadFileDescriptor,
                 else => |err| return unexpectedErrno(err),
             }
@@ -374,12 +372,6 @@ pub const posix = struct {
         }
     }
 
-    /// Duplicate `fd` to a descriptor >= 10 with close-on-exec set.
-    ///
-    /// Used for the shell's internal fd bookkeeping (redirect backups, capture
-    /// backups, the trace channel): user redirects can only target fds 0-9, so
-    /// a backup parked at >=10 can never be clobbered by `3>file`, and CLOEXEC
-    /// keeps it from leaking into any child the shell execs.
     pub fn dupHighCloexec(fd: fd_t) FcntlError!fd_t {
         const F_DUPFD_CLOEXEC = 1030;
         return @intCast(try fcntl(fd, F_DUPFD_CLOEXEC, 10));
@@ -402,10 +394,6 @@ pub const posix = struct {
         switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stat))) {
             .SUCCESS => return stat,
             .INVAL => unreachable,
-            // Not "always a race condition": fstat on a descriptor that was
-            // never opened is how you *probe* for one, which is exactly what
-            // the session trace does for fd 3. Asserting here turned "no
-            // harness attached" into a panic on every plain `zish -c`.
             .BADF => return error.BadFileDescriptor,
             .NOMEM => return error.SystemResources,
             .ACCES => return error.AccessDenied,
@@ -417,13 +405,6 @@ pub const posix = struct {
         return system.isatty(handle) != 0;
     }
 
-    /// The subset of stat(2) the shell's file-test operators need, in a shape
-    /// that does not depend on the platform's struct layout.
-    ///
-    /// Necessary because the two sides disagree: 0.16 dropped std.c.Stat on
-    /// linux in favour of statx, while statx does not exist anywhere else.
-    /// Callers ([ -O ], [ -G ], [ -ef ], [ -nt ], [ -ot ], [ -L ]) should not
-    /// have to care which one they are compiled against.
     pub const FileStat = struct {
         dev: u64,
         ino: u64,
@@ -433,16 +414,11 @@ pub const posix = struct {
         mtime_ns: i128,
     };
 
-    // Wrapped in a namespace rather than renamed: an unprefixed `stat` at this
-    // scope collides with the local of that name in fstat below, but renaming
-    // the extern renames the *symbol* and the link then fails on _c_stat.
     const libc = struct {
         extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
         extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
     };
 
-    /// stat a path. `follow` = false is lstat (do not follow symlinks).
-    /// Returns null when the path cannot be stat'd, for any reason.
     pub fn statPath(pathz: [*:0]const u8, follow: bool) ?FileStat {
         if (builtin.os.tag == .linux) {
             const linux = std.os.linux;
@@ -451,8 +427,6 @@ pub const posix = struct {
             const flags: u32 = if (follow) 0 else linux.AT.SYMLINK_NOFOLLOW;
             if (linux.statx(linux.AT.FDCWD, pathz, flags, mask, &st) != 0) return null;
             return .{
-                // statx splits the device into major/minor; recombine so the
-                // field means the same thing as st_dev does elsewhere.
                 .dev = (@as(u64, st.dev_major) << 32) | @as(u64, st.dev_minor),
                 .ino = st.ino,
                 .uid = st.uid,
@@ -480,12 +454,6 @@ pub const posix = struct {
         return system.getpid();
     }
 
-    /// Fill `buf` with cryptographically-strong random bytes. Used to make
-    /// temp-file names unguessable so an attacker cannot pre-create or
-    /// pre-symlink one (the security against a symlink clobber comes from
-    /// O_EXCL; this closes the pre-creation DoS and any guessing). Best-effort:
-    /// on failure the buffer is left as-is, and the O_EXCL create still fails
-    /// closed on a collision.
     pub fn randomBytes(buf: []u8) void {
         if (builtin.os.tag == .linux) {
             var off: usize = 0;
@@ -497,119 +465,6 @@ pub const posix = struct {
             }
         } else {
             std.crypto.random.bytes(buf);
-        }
-    }
-
-    // libc-backed and therefore portable. A raw `syscall1(.getpgid, 0)` compiles
-    // for any target but emits a Linux syscall, so it is wrong at runtime
-    // everywhere else rather than failing to build.
-
-    // Zig 0.16 has no std.c binding for these two, so declare them. Going
-    // through libc rather than a raw syscall is what makes them portable: a
-    // std.os.linux.syscall1 compiles for any target but emits a Linux syscall,
-    // so it is silently wrong elsewhere instead of failing to build.
-    extern "c" fn getpgid(pid: pid_t) pid_t;
-    extern "c" fn wait4(pid: pid_t, status: ?*c_int, options: c_int, usage: ?*anyopaque) pid_t;
-
-    pub fn getProcessGroup(pid: pid_t) pid_t {
-        return getpgid(pid);
-    }
-
-    pub fn geteuid() std.posix.uid_t {
-        return system.geteuid();
-    }
-
-    pub fn getegid() std.posix.gid_t {
-        return system.getegid();
-    }
-
-    /// waitpid plus resource usage. Used by the `time` builtin.
-    pub fn waitRusage(pid: pid_t, status: *u32, options: u32, usage: ?*anyopaque) pid_t {
-        return wait4(pid, @ptrCast(status), @intCast(options), usage);
-    }
-
-    pub fn exit(status: u8) noreturn {
-        std.c.exit(status);
-    }
-
-    pub const ForkError = error{ SystemResources, Unexpected };
-
-    pub fn fork() ForkError!pid_t {
-        const rc = system.fork();
-        switch (errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .AGAIN => return error.SystemResources,
-            .NOMEM => return error.SystemResources,
-            else => |err| return unexpectedErrno(err),
-        }
-    }
-
-    pub const WaitPidResult = struct {
-        pid: pid_t,
-        status: u32,
-    };
-
-    pub fn waitpid(pid: pid_t, flags: u32) WaitPidResult {
-        var status: c_int = undefined;
-        while (true) {
-            const rc = system.waitpid(pid, &status, @intCast(flags));
-            switch (errno(rc)) {
-                .SUCCESS => return .{ .pid = @intCast(rc), .status = @bitCast(status) },
-                .INTR => continue,
-                // No (more) children. Callers signal this via pid <= 0 (e.g. the
-                // `wait` builtin's reap loop); crashing here aborted the whole
-                // shell on `sleep 0.1 & wait`.
-                .CHILD => return .{ .pid = -1, .status = 0 },
-                .INVAL => unreachable, // invalid flags (we only pass 0 / NOHANG)
-                else => return .{ .pid = -1, .status = 0 },
-            }
-        }
-    }
-
-    pub const GetCwdError = error{ CurrentWorkingDirectoryUnlinked, NameTooLong, Unexpected };
-
-    pub fn getcwd(out_buffer: []u8) GetCwdError![]u8 {
-        const c_err = if (std.c.getcwd(out_buffer.ptr, out_buffer.len)) |_| 0 else std.c._errno().*;
-        const err: E = @enumFromInt(c_err);
-        switch (err) {
-            .SUCCESS => return mem.sliceTo(out_buffer, 0),
-            .FAULT => unreachable,
-            .INVAL => unreachable,
-            .NOENT => return error.CurrentWorkingDirectoryUnlinked,
-            .RANGE => return error.NameTooLong,
-            else => return unexpectedErrno(err),
-        }
-    }
-
-    pub const ChangeCurDirError = error{
-        AccessDenied,
-        FileSystem,
-        SymLinkLoop,
-        NameTooLong,
-        FileNotFound,
-        SystemResources,
-        NotDir,
-        BadPathName,
-        Unexpected,
-    };
-
-    pub fn chdir(dir_path: []const u8) ChangeCurDirError!void {
-        const dir_path_c = toPosixPath(dir_path) catch return error.NameTooLong;
-        return chdirZ(&dir_path_c);
-    }
-
-    pub fn chdirZ(dir_path: [*:0]const u8) ChangeCurDirError!void {
-        switch (errno(system.chdir(dir_path))) {
-            .SUCCESS => return,
-            .ACCES => return error.AccessDenied,
-            .FAULT => unreachable,
-            .IO => return error.FileSystem,
-            .LOOP => return error.SymLinkLoop,
-            .NAMETOOLONG => return error.NameTooLong,
-            .NOENT => return error.FileNotFound,
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => return error.NotDir,
-            else => |err| return unexpectedErrno(err),
         }
     }
 
@@ -672,9 +527,6 @@ pub const posix = struct {
             .NOTDIR => return error.NotDir,
             .TXTBSY => return error.FileBusy,
             else => |err| {
-                // ELIBBAD is Linux-only. Looked up by name rather than written
-                // as `.LIBBAD` so this compiles on platforms whose errno enum
-                // does not define it.
                 const ErrT = @TypeOf(err);
                 if (comptime @hasField(ErrT, "LIBBAD")) {
                     if (err == @field(ErrT, "LIBBAD")) return error.InvalidExe;
