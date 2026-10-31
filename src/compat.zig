@@ -42,30 +42,25 @@ pub fn io() std.Io {
 }
 
 // ---------------------------------------------------------------------------
-// Time (std.time.timestamp/milliTimestamp/nanoTimestamp, Thread.sleep, Timer
-// were removed in 0.16 — clocks now live behind Io)
+// Time
 // ---------------------------------------------------------------------------
 
 fn nowNs(clock: std.Io.Clock) i96 {
     return std.Io.Clock.now(clock, io()).nanoseconds;
 }
 
-/// std.time.timestamp() — seconds since epoch.
 pub fn timestamp() i64 {
     return @intCast(@divFloor(nowNs(.real), std.time.ns_per_s));
 }
 
-/// std.time.milliTimestamp().
 pub fn milliTimestamp() i64 {
     return @intCast(@divFloor(nowNs(.real), std.time.ns_per_ms));
 }
 
-/// std.time.nanoTimestamp().
 pub fn nanoTimestamp() i128 {
     return @intCast(nowNs(.real));
 }
 
-/// std.Thread.sleep(ns).
 pub fn sleep(ns: u64) void {
     const dur: std.Io.Clock.Duration = .{
         .raw = .fromNanoseconds(@intCast(ns)),
@@ -75,11 +70,9 @@ pub fn sleep(ns: u64) void {
 }
 
 // ---------------------------------------------------------------------------
-// 0.15 File.readAll / File.writeAll replacements (sequential, work on pipes
-// and regular files alike)
+// File I/O replacements
 // ---------------------------------------------------------------------------
 
-/// Sequential read until buffer full or EOF; returns bytes read.
 pub fn readAll(file: std.Io.File, buf: []u8) !usize {
     var n: usize = 0;
     while (n < buf.len) {
@@ -90,13 +83,12 @@ pub fn readAll(file: std.Io.File, buf: []u8) !usize {
     return n;
 }
 
-/// Sequential write of all bytes.
 pub fn writeAll(file: std.Io.File, bytes: []const u8) !void {
     return file.writeStreamingAll(io(), bytes);
 }
 
 // ---------------------------------------------------------------------------
-// Env access (std.posix.getenv / std.process.getEnvVarOwned replacements)
+// Env access
 // ---------------------------------------------------------------------------
 
 pub const GetEnvVarOwnedError = error{ OutOfMemory, EnvironmentVariableNotFound, InvalidWtf8 };
@@ -112,6 +104,19 @@ pub fn getEnvVarOwned(allocator: mem.Allocator, key: []const u8) GetEnvVarOwnedE
 
 pub const posix = struct {
     const system = std.c;
+
+    // --- Bionic libc direct bindings (avoids std.c/std.posix stripping) ---
+    const libc = struct {
+        extern "c" fn exit(status: c_int) noreturn;
+        extern "c" fn getpgid(pid: pid_t) pid_t;
+        extern "c" fn getegid() c_uint;
+        extern "c" fn geteuid() c_uint;
+        extern "c" fn fork() pid_t;
+        extern "c" fn waitpid(pid: pid_t, status: *c_int, options: c_int) pid_t;
+        extern "c" fn lseek64(fd: fd_t, offset: i64, whence: c_int) i64;
+        extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+        extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+    };
 
     // --- re-exports still present in 0.16 std.posix ---
     pub const fd_t = std.posix.fd_t;
@@ -152,21 +157,56 @@ pub const posix = struct {
     pub const Stat = if (builtin.os.tag == .linux) std.os.linux.Statx else std.c.Stat;
     pub const ReadError = std.posix.ReadError;
 
-    // --- lifted from zig 0.15.2 std.posix (libc-backed, linux only) ---
+    // --- lifted implementations ---
 
-    pub const GetCwdError = error{
-        NameTooLong,
-        AccessDenied,
-        Unexpected,
+    pub fn exit(status: u8) noreturn {
+        libc.exit(status);
+    }
+
+    pub const ForkError = error{ SystemResources, Unexpected };
+
+    pub fn fork() ForkError!pid_t {
+        const rc = libc.fork();
+        if (rc < 0) {
+            switch (errno(rc)) {
+                .AGAIN => return error.SystemResources,
+                .NOMEM => return error.SystemResources,
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+        return rc;
+    }
+
+    pub const WaitPidResult = struct {
+        pid: pid_t,
+        status: u32,
     };
+
+    pub fn waitpid(pid: pid_t, flags: u32) WaitPidResult {
+        var status: c_int = 0;
+        const rc = libc.waitpid(pid, &status, @intCast(flags));
+        return .{ .pid = rc, .status = @bitCast(status) };
+    }
+
+    pub fn getProcessGroup(pid: pid_t) pid_t {
+        return libc.getpgid(pid);
+    }
+
+    pub fn getegid() u32 {
+        return @intCast(libc.getegid());
+    }
+
+    pub fn geteuid() u32 {
+        return @intCast(libc.geteuid());
+    }
+
+    pub const GetCwdError = error{ NameTooLong, AccessDenied, Unexpected };
 
     pub fn getcwd(buf: []u8) GetCwdError![]u8 {
         if (builtin.os.tag == .linux) {
             const rc = std.os.linux.getcwd(buf.ptr, buf.len);
             const signed_rc: isize = @bitCast(rc);
-            if (signed_rc >= 0) {
-                return buf[0..@intCast(signed_rc)];
-            }
+            if (signed_rc >= 0) return buf[0..@intCast(signed_rc)];
             switch (std.posix.errno(signed_rc)) {
                 .RANGE => return error.NameTooLong,
                 .ACCES => return error.AccessDenied,
@@ -174,9 +214,7 @@ pub const posix = struct {
             }
         } else {
             const rc = system.getcwd(buf.ptr, buf.len);
-            if (rc != null) {
-                return mem.sliceTo(buf, 0);
-            }
+            if (rc != null) return mem.sliceTo(buf, 0);
             switch (errno(-1)) {
                 .RANGE => return error.NameTooLong,
                 .ACCES => return error.AccessDenied,
@@ -225,15 +263,10 @@ pub const posix = struct {
         }
     }
 
-    /// Reposition the file offset. `whence` is SEEK_SET(0)/CUR(1)/END(2).
-    /// Returns the resulting offset.
     pub fn lseek(fd: fd_t, offset: i64, whence: u32) !i64 {
         if (builtin.os.tag == .linux) {
-            // On 32-bit Android, std.os.linux.lseek causes a @bitCast size mismatch
-            // (i64 -> usize). Bionic provides lseek64 for exactly this purpose.
             if (builtin.target.abi.isAndroid() and builtin.target.ptrBitWidth() == 32) {
-                const lseek64 = @extern(*const fn (fd_t, i64, c_int) callconv(.c) i64, .{ .name = "lseek64" });
-                const rc = lseek64(fd, offset, @intCast(whence));
+                const rc = libc.lseek64(fd, offset, @intCast(whence));
                 if (rc < 0) return error.SeekFailed;
                 return rc;
             }
@@ -260,25 +293,11 @@ pub const posix = struct {
     }
 
     pub const WriteError = error{
-        DiskQuota,
-        FileTooBig,
-        InputOutput,
-        NoSpaceLeft,
-        DeviceBusy,
-        InvalidArgument,
-        AccessDenied,
-        PermissionDenied,
-        BrokenPipe,
-        SystemResources,
-        OperationAborted,
-        NotOpenForWriting,
-        LockViolation,
-        WouldBlock,
-        ConnectionResetByPeer,
-        ProcessNotFound,
-        NoDevice,
-        MessageTooBig,
-        Unexpected,
+        DiskQuota, FileTooBig, InputOutput, NoSpaceLeft, DeviceBusy,
+        InvalidArgument, AccessDenied, PermissionDenied, BrokenPipe,
+        SystemResources, OperationAborted, NotOpenForWriting, LockViolation,
+        WouldBlock, ConnectionResetByPeer, ProcessNotFound, NoDevice,
+        MessageTooBig, Unexpected,
     };
 
     pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
@@ -311,24 +330,10 @@ pub const posix = struct {
     }
 
     pub const OpenError = error{
-        AccessDenied,
-        PermissionDenied,
-        FileTooBig,
-        IsDir,
-        SymLinkLoop,
-        ProcessFdQuotaExceeded,
-        NameTooLong,
-        SystemFdQuotaExceeded,
-        NoDevice,
-        FileNotFound,
-        ProcessNotFound,
-        SystemResources,
-        NoSpaceLeft,
-        NotDir,
-        PathAlreadyExists,
-        DeviceBusy,
-        BadPathName,
-        Unexpected,
+        AccessDenied, PermissionDenied, FileTooBig, IsDir, SymLinkLoop,
+        ProcessFdQuotaExceeded, NameTooLong, SystemFdQuotaExceeded, NoDevice,
+        FileNotFound, ProcessNotFound, SystemResources, NoSpaceLeft, NotDir,
+        PathAlreadyExists, DeviceBusy, BadPathName, Unexpected,
     };
 
     pub fn open(file_path: []const u8, flags: O, perm: mode_t) OpenError!fd_t {
@@ -367,11 +372,7 @@ pub const posix = struct {
         }
     }
 
-    pub const PipeError = error{
-        SystemFdQuotaExceeded,
-        ProcessFdQuotaExceeded,
-        Unexpected,
-    };
+    pub const PipeError = error{ SystemFdQuotaExceeded, ProcessFdQuotaExceeded, Unexpected };
 
     pub fn pipe() PipeError![2]fd_t {
         var fds: [2]fd_t = undefined;
@@ -386,13 +387,8 @@ pub const posix = struct {
     }
 
     pub const FcntlError = error{
-        Locked,
-        FileBusy,
-        PermissionDenied,
-        ProcessFdQuotaExceeded,
-        DeadLock,
-        LockedRegionLimitExceeded,
-        Unexpected,
+        Locked, FileBusy, PermissionDenied, ProcessFdQuotaExceeded,
+        DeadLock, LockedRegionLimitExceeded, Unexpected,
     };
 
     pub fn fcntl(fd: fd_t, cmd: i32, arg: usize) FcntlError!usize {
@@ -449,17 +445,7 @@ pub const posix = struct {
     }
 
     pub const FileStat = struct {
-        dev: u64,
-        ino: u64,
-        uid: u32,
-        gid: u32,
-        mode: u32,
-        mtime_ns: i128,
-    };
-
-    const libc = struct {
-        extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
-        extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+        dev: u64, ino: u64, uid: u32, gid: u32, mode: u32, mtime_ns: i128,
     };
 
     pub fn statPath(pathz: [*:0]const u8, follow: bool) ?FileStat {
@@ -471,10 +457,7 @@ pub const posix = struct {
             if (linux.statx(linux.AT.FDCWD, pathz, flags, mask, &st) != 0) return null;
             return .{
                 .dev = (@as(u64, st.dev_major) << 32) | @as(u64, st.dev_minor),
-                .ino = st.ino,
-                .uid = st.uid,
-                .gid = st.gid,
-                .mode = st.mode,
+                .ino = st.ino, .uid = st.uid, .gid = st.gid, .mode = st.mode,
                 .mtime_ns = @as(i128, st.mtime.sec) * std.time.ns_per_s + @as(i128, st.mtime.nsec),
             };
         }
@@ -484,22 +467,13 @@ pub const posix = struct {
         const st = cst;
         const ts = st.mtime();
         return .{
-            .dev = @intCast(@as(i64, st.dev)),
-            .ino = @intCast(st.ino),
-            .uid = st.uid,
-            .gid = st.gid,
-            .mode = st.mode,
+            .dev = @intCast(@as(i64, st.dev)), .ino = @intCast(st.ino), .uid = st.uid,
+            .gid = st.gid, .mode = st.mode,
             .mtime_ns = @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
         };
     }
 
-    pub fn getpid() pid_t {
-        return system.getpid();
-    }
-
-    pub fn geteuid() u32 {
-        return @intCast(system.geteuid());
-    }
+    pub fn getpid() pid_t { return system.getpid(); }
 
     pub fn randomBytes(buf: []u8) void {
         if (builtin.os.tag == .linux) {
@@ -515,41 +489,8 @@ pub const posix = struct {
         }
     }
 
-    pub const ForkError = error{ SystemResources, Unexpected };
-
-    pub fn fork() ForkError!pid_t {
-        const rc = system.fork();
-        if (rc < 0) {
-            switch (errno(rc)) {
-                .AGAIN => return error.SystemResources,
-                .NOMEM => return error.SystemResources,
-                else => |err| return unexpectedErrno(err),
-            }
-        }
-        return rc;
-    }
-
-    pub fn getProcessGroup(pid: pid_t) pid_t {
-        return system.getpgid(pid);
-    }
-
-    pub const WaitPidResult = struct {
-        pid: pid_t,
-        status: u32,
-    };
-
-    pub fn waitpid(pid: pid_t, flags: u32) WaitPidResult {
-        var status: c_int = 0;
-        const rc = system.waitpid(pid, &status, @intCast(flags));
-        return .{ .pid = rc, .status = @bitCast(status) };
-    }
-
     pub const SetPgidError = error{
-        ProcessAlreadyExec,
-        InvalidProcessGroupId,
-        PermissionDenied,
-        ProcessNotFound,
-        Unexpected,
+        ProcessAlreadyExec, InvalidProcessGroupId, PermissionDenied, ProcessNotFound, Unexpected,
     };
 
     pub fn setpgid(pid: pid_t, pgid: pid_t) SetPgidError!void {
@@ -564,19 +505,9 @@ pub const posix = struct {
     }
 
     pub const ExecveError = error{
-        SystemResources,
-        AccessDenied,
-        PermissionDenied,
-        InvalidExe,
-        FileSystem,
-        IsDir,
-        FileNotFound,
-        NotDir,
-        FileBusy,
-        ProcessFdQuotaExceeded,
-        SystemFdQuotaExceeded,
-        NameTooLong,
-        Unexpected,
+        SystemResources, AccessDenied, PermissionDenied, InvalidExe,
+        FileSystem, IsDir, FileNotFound, NotDir, FileBusy,
+        ProcessFdQuotaExceeded, SystemFdQuotaExceeded, NameTooLong, Unexpected,
     };
 
     pub fn execveZ(
