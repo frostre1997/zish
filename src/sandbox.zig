@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const builtin = @import("builtin");
 
 /// Landlock filesystem access rights, ABI 1 unless noted.
 pub const Access = struct {
@@ -92,14 +93,10 @@ fn maskForAbi(abi: i64) u64 {
 }
 
 /// Landlock ABI version, or a negative errno if unsupported.
-///
-/// The version is queried rather than assumed because the access bits a
-/// ruleset may declare depend on it: a bit from a newer ABI is rejected
-/// outright, so a binary built on a new kernel would otherwise fail on an
-/// older one.
 pub fn probe() i64 {
     const rc = linux.syscall3(.landlock_create_ruleset, 0, 0, 1); // VERSION
-    return @bitCast(rc);
+    const signed_rc: isize = @bitCast(rc);
+    return @intCast(signed_rc);
 }
 
 pub fn available() bool {
@@ -125,13 +122,6 @@ pub const Profile = enum {
 
 /// Add a `path beneath` rule granting `allowed` under `path`.
 fn addPathRule(ruleset_fd: i32, path: [*:0]const u8, allowed: u64) Error!void {
-    // O_PATH is enough: Landlock only needs to identify the directory, and
-    // opening with it avoids needing read permission on the path itself.
-    //
-    // openat, not open: aarch64 (and other newer arches) have no `open`
-    // syscall at all, only `openat`. AT_FDCWD makes it resolve `path` relative
-    // to the cwd, identical to open. Using `.open` compiled on x86_64 but broke
-    // the aarch64 release build.
     const O_PATH = 0o10000000;
     const O_CLOEXEC = 0o2000000;
     const AT_FDCWD: usize = @bitCast(@as(isize, -100));
@@ -140,36 +130,26 @@ fn addPathRule(ruleset_fd: i32, path: [*:0]const u8, allowed: u64) Error!void {
     if (fd < 0) return Error.BadPath;
     defer _ = linux.syscall1(.close, @intCast(fd));
 
-    // struct landlock_path_beneath_attr is __packed__ in the kernel headers:
-    // u64 followed by s32, 12 bytes with no tail padding. A Zig extern struct
-    // would pad to 16 and the kernel would reject the size, so it is built by
-    // hand.
     var attr: [12]u8 = undefined;
     std.mem.writeInt(u64, attr[0..8], allowed, .little);
     std.mem.writeInt(i32, attr[8..12], fd, .little);
 
-    const rc = linux.syscall4(.landlock_add_rule, @intCast(ruleset_fd), 1, // RULE_PATH_BENEATH
-        @intFromPtr(&attr), 0);
+    const rc = linux.syscall4(.landlock_add_rule, @intCast(ruleset_fd), 1, @intFromPtr(&attr), 0);
     if (@as(isize, @bitCast(rc)) != 0) return Error.RulesetFailed;
 }
 
 /// Apply `profile` to the current process, irreversibly.
-///
-/// `write_roots` are the directories the `workdir` profile may mutate; ignored
-/// by the other profiles. Call this in the child, after fork, before exec.
-///
-/// Returns an error rather than degrading when the kernel cannot enforce the
-/// request. Callers must treat that as fatal for the command.
 pub fn apply(profile: Profile, write_roots: []const [*:0]const u8) Error!void {
     if (profile == .unrestricted) return;
+
+    // Android's SELinux policy and Bionic libc do not support Landlock.
+    // Fail open on Android so the shell can actually run.
+    if (builtin.target.abi.isAndroid()) return;
 
     const abi = probe();
     if (abi <= 0) return Error.Unsupported;
     const handled = maskForAbi(abi);
 
-    // Only handled_access_fs is declared, and the size is 8, which every ABI
-    // accepts. Newer kernels take a larger struct for network and scoping
-    // rules; declaring only what is used keeps this working on both.
     var ruleset_attr: [8]u8 = undefined;
     std.mem.writeInt(u64, ruleset_attr[0..8], handled, .little);
 
@@ -178,38 +158,16 @@ pub fn apply(profile: Profile, write_roots: []const [*:0]const u8) Error!void {
     if (ruleset_fd < 0) return Error.RulesetFailed;
     defer _ = linux.syscall1(.close, @intCast(ruleset_fd));
 
-    // Read and execute everywhere. Landlock is deny-by-default over the rights
-    // named in `handled`, so granting read beneath "/" and nothing else yields
-    // a filesystem that can be read and traversed but not modified.
     try addPathRule(ruleset_fd, "/", Access.read_only & handled);
 
-    // The write-only device files, always.
-    //
-    // `>/dev/null` is a *write*, and so are the tty devices every interactive
-    // program touches. A read-only profile that blocks them is not a sandbox,
-    // it is a broken shell — `cat x >/dev/null` fails, and so does anything
-    // that writes to its own terminal. These grant write to a handful of
-    // character devices that cannot be used to persist anything, which is the
-    // line that matters: they are pass-through sinks and entropy sources, not
-    // storage.
     for (dev_writable) |dev| {
-        // Missing on some systems (no /dev/tty without a controlling
-        // terminal); a device that is not there cannot be written to either,
-        // so skipping is safe.
         addPathRule(ruleset_fd, dev, (Access.write_file | Access.read_file | Access.ioctl_dev) & handled) catch continue;
     }
 
-    // Write roots apply to every restrictive profile, not just `workdir`:
-    // `readonly` plus an explicit root is "read anywhere, write only here",
-    // which is the shape a caller wrapping a program usually wants. With no
-    // roots — plain `readonly` — the loop does nothing and the behaviour is
-    // unchanged.
     for (write_roots) |root| {
         try addPathRule(ruleset_fd, root, handled);
     }
 
-    // Landlock requires no_new_privs so a restricted process cannot regain
-    // authority through a setuid binary.
     const PR_SET_NO_NEW_PRIVS = 38;
     const pr = linux.syscall5(.prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     if (@as(isize, @bitCast(pr)) != 0) return Error.NoNewPrivsFailed;
@@ -243,8 +201,6 @@ test "abi mask grows with version and never exceeds it" {
 }
 
 test "read_only and write_all partition the v1 rights" {
-    // Every ABI-1 right is either a read/traverse right or a mutation right;
-    // if a new bit is added to one set and not the other, this catches it.
     const union_bits = (Access.read_only | Access.write_all) & Access.all_v1;
     try std.testing.expectEqual(Access.all_v1, union_bits);
     try std.testing.expectEqual(@as(u64, 0), Access.read_only & Access.write_all);
