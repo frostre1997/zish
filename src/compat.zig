@@ -167,7 +167,7 @@ pub const posix = struct {
             if (signed_rc >= 0) {
                 return buf[0..@intCast(signed_rc)];
             }
-            switch (std.os.linux.E.init(rc)) {
+            switch (std.posix.errno(signed_rc)) {
                 .RANGE => return error.NameTooLong,
                 .ACCES => return error.AccessDenied,
                 else => |err| return unexpectedErrno(err),
@@ -213,6 +213,18 @@ pub const posix = struct {
         }
     }
 
+    pub fn chdir(path: []const u8) !void {
+        const path_c = toPosixPath(path) catch return error.NameTooLong;
+        switch (errno(system.chdir(&path_c))) {
+            .SUCCESS => return,
+            .ACCES => return error.AccessDenied,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .NAMETOOLONG => return error.NameTooLong,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+
     /// Reposition the file offset. `whence` is SEEK_SET(0)/CUR(1)/END(2).
     /// Returns the resulting offset.
     pub fn lseek(fd: fd_t, offset: i64, whence: u32) !i64 {
@@ -220,7 +232,7 @@ pub const posix = struct {
             // On 32-bit Android, std.os.linux.lseek causes a @bitCast size mismatch
             // (i64 -> usize). Bionic provides lseek64 for exactly this purpose.
             if (builtin.target.abi.isAndroid() and builtin.target.ptrBitWidth() == 32) {
-                const lseek64 = @extern(*const fn (fd_t, i64, c_int) callconv(.C) i64, .{ .name = "lseek64" });
+                const lseek64 = @extern(*const fn (fd_t, i64, c_int) callconv(.c) i64, .{ .name = "lseek64" });
                 const rc = lseek64(fd, offset, @intCast(whence));
                 if (rc < 0) return error.SeekFailed;
                 return rc;
@@ -485,6 +497,10 @@ pub const posix = struct {
         return system.getpid();
     }
 
+    pub fn geteuid() u32 {
+        return @intCast(system.geteuid());
+    }
+
     pub fn randomBytes(buf: []u8) void {
         if (builtin.os.tag == .linux) {
             var off: usize = 0;
@@ -497,6 +513,35 @@ pub const posix = struct {
         } else {
             std.crypto.random.bytes(buf);
         }
+    }
+
+    pub const ForkError = error{ SystemResources, Unexpected };
+
+    pub fn fork() ForkError!pid_t {
+        const rc = system.fork();
+        if (rc < 0) {
+            switch (errno(rc)) {
+                .AGAIN => return error.SystemResources,
+                .NOMEM => return error.SystemResources,
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+        return rc;
+    }
+
+    pub fn getProcessGroup(pid: pid_t) pid_t {
+        return system.getpgid(pid);
+    }
+
+    pub const WaitPidResult = struct {
+        pid: pid_t,
+        status: u32,
+    };
+
+    pub fn waitpid(pid: pid_t, flags: u32) WaitPidResult {
+        var status: c_int = 0;
+        const rc = system.waitpid(pid, &status, @intCast(flags));
+        return .{ .pid = rc, .status = @bitCast(status) };
     }
 
     pub const SetPgidError = error{
